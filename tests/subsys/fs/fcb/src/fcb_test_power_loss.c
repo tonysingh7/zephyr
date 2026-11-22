@@ -8,6 +8,9 @@
 
 #include "fcb_test.h"
 
+/* Only the flash simulator can cut power, real flash boards skip these tests */
+#ifdef CONFIG_FLASH_SIMULATOR_STATS
+
 /*
  * These tests cut power in the middle of a flash write using the flash
  * simulator: the write numbered max_write_calls keeps only its first
@@ -211,3 +214,5 @@ static void power_loss_after(void *data)
 }
 
 ZTEST_SUITE(fcb_test_power_loss, NULL, NULL, power_loss_before, power_loss_after, NULL);
+
+#endif /* CONFIG_FLASH_SIMULATOR_STATS */
