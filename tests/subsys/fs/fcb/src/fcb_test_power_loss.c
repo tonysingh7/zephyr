@@ -114,6 +114,82 @@ ZTEST(fcb_test_power_loss, test_fcb_torn_len)
 	zassert_equal(cnt, 35, "new entry missing after recovery");
 }
 
+static int count_entries_cb(struct fcb_entry_ctx *entry_ctx, void *arg)
+{
+	int *count = arg;
+
+	(*count)++;
+	return 0;
+}
+
+/* Fill the active sector with 32 byte entries until the next one won't fit. */
+static int fill_active_sector(struct fcb *fcb)
+{
+	int entry_size = fcb_len_in_flash(fcb, 1) + fcb_len_in_flash(fcb, 32) +
+			 fcb_len_in_flash(fcb, FCB_CRC_SZ);
+	int n = 0;
+
+	while (fcb->f_active.fe_elem_off + entry_size <= fcb->f_active.fe_sector->fs_size) {
+		append_entry(fcb, 32);
+		n++;
+	}
+
+	return n;
+}
+
+/* #121749: power cut while writing the header of a new sector */
+ZTEST(fcb_test_power_loss, test_fcb_torn_sector_hdr)
+{
+	struct fcb *fcb = &test_fcb;
+	struct fcb_entry loc;
+	int written;
+	int cnt;
+	int rc;
+
+	written = fill_active_sector(fcb);
+	zassert_true(written > 0);
+
+	/* the next entry needs a new sector, so fcb_append writes the new
+	 * sector header first; only 2 bytes of its magic get written
+	 */
+	cut_power_on_next_write(2);
+	rc = fcb_append(fcb, 32, &loc);
+	zassert_equal(rc, 0, "fcb_append failed: %d", rc);
+	restore_power();
+
+	rc = reboot_fcb(fcb);
+	zassert_equal(rc, 0, "fcb_init after torn sector header failed: %d", rc);
+
+	/* everything in the full sector is still there */
+	cnt = 0;
+	rc = fcb_walk(fcb, NULL, count_entries_cb, &cnt);
+	zassert_equal(rc, 0, "fcb_walk failed: %d", rc);
+	zassert_equal(cnt, written, "entries written before the power cut are missing");
+
+	/* and the next entry can go into the sector with the torn header */
+	append_entry(fcb, 32);
+
+	cnt = 0;
+	rc = fcb_walk(fcb, NULL, count_entries_cb, &cnt);
+	zassert_equal(rc, 0, "fcb_walk failed: %d", rc);
+	zassert_equal(cnt, written + 1, "new entry missing after recovery");
+}
+
+/* A sector that was never ours must still be rejected, the fix must not hide that. */
+ZTEST(fcb_test_power_loss, test_fcb_foreign_sector_rejected)
+{
+	struct fcb *fcb = &test_fcb;
+	const uint8_t garbage[4] = {0x12, 0x34, 0x56, 0x78};
+	int rc;
+
+	test_fcb_wipe();
+	rc = flash_area_write(fcb->fap, test_fcb_sector[0].fs_off, garbage, sizeof(garbage));
+	zassert_equal(rc, 0, "flash_area_write failed: %d", rc);
+
+	rc = reboot_fcb(fcb);
+	zassert_equal(rc, -ENOMSG, "fcb_init should reject a foreign sector, got %d", rc);
+}
+
 static void power_loss_before(void *data)
 {
 	stats_walk(stats_group_find("flash_sim_stats"), find_sim_stat, NULL);
