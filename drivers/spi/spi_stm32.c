@@ -516,6 +516,7 @@ static void spi_dma_enable_requests(SPI_TypeDef *spi)
 	}
 }
 
+#ifndef CONFIG_SPI_RTIO
 static void spi_stm32_dma_tx_done(const struct device *dev)
 {
 	const struct spi_stm32_config *cfg = dev->config;
@@ -526,6 +527,7 @@ static void spi_stm32_dma_tx_done(const struct device *dev)
 	}
 #endif /* SPI_SR_FTLVL */
 }
+#endif /* !CONFIG_SPI_RTIO */
 
 static void spi_stm32_dma_rx_done(const struct device *dev, const struct spi_config *config)
 {
@@ -1081,16 +1083,13 @@ static void spi_stm32_iodev_msg_start(const struct device *dev, struct spi_confi
 		tx_cfg->dest_data_size   = tx_cfg->dest_burst_length   = dfs;
 
 		spi_dma_enable_requests(spi);
-		LL_SPI_Enable(spi);
 		spi_stm32_cs_control(dev, true);
-#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
-		LL_SPI_StartMasterTransfer(spi);
-#endif /* st_stm32h7_spi */
 
 		data->status_flags = 0;
 		data->tx_len = data->ctx.tx_len;
 		data->rx_len = data->ctx.rx_len;
 
+		/* Arm the DMA, then enable the SPI, see transceive_dma() */
 		if (transfer_dir == STM32_SPI_FULL_DUPLEX) {
 			dma_len = spi_context_max_continuous_chunk(&data->ctx);
 			ret = spi_dma_move_buffers(dev, dma_len);
@@ -1104,7 +1103,15 @@ static void spi_stm32_iodev_msg_start(const struct device *dev, struct spi_confi
 		if (ret != 0) {
 			LOG_ERR("Failed to start SPI DMA transfer");
 			spi_stm32_iodev_complete(dev, -EIO);
+			return;
 		}
+
+		LL_SPI_Enable(spi);
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+		if (SPI_OP_MODE_GET(config->operation) == SPI_OP_MODE_CONTROLLER) {
+			LL_SPI_StartMasterTransfer(spi);
+		}
+#endif /* st_stm32h7_spi */
 
 		return;
 	}
@@ -1295,6 +1302,11 @@ static void spi_stm32_complete(const struct device *dev, int status)
 #endif /* compat st_stm32_spi_fifo*/
 
 	if (LL_SPI_GetMode(spi) == LL_SPI_MODE_MASTER) {
+#ifdef SPI_SR_FTLVL
+		/* Disable procedure: the TX FIFO empties before BSY is checked */
+		while ((LL_SPI_GetTxFIFOLevel(spi) != 0U) && LL_SPI_IsEnabled(spi)) {
+		}
+#endif /* SPI_SR_FTLVL */
 		while (ll_spi_is_busy(spi) && LL_SPI_IsEnabled(spi)) {
 #if DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
 			uint32_t width = SPI_WORD_SIZE_GET(data->ctx.config->operation);
@@ -2084,7 +2096,7 @@ static void dma_callback_async(const struct device *spi_dev, uint32_t channel, i
 			LOG_DBG("DMA Tx transfer is done");
 		}
 
-		spi_stm32_dma_tx_done(spi_dev);
+		/* Never wait for the TX FIFO here: SPE may still be clear */
 		data->status_flags |= SPI_STM32_DMA_TX_DONE_FLAG;
 	} else if (channel == data->dma_rx.channel) {
 		/* this part of the transfer ends */
@@ -2233,13 +2245,7 @@ static int transceive_dma(const struct device *dev,
 
 	/* Set request before enabling (otherwise SPI CFG1 reg may be write protected) */
 	spi_dma_enable_requests(spi);
-	LL_SPI_Enable(spi);
 	spi_stm32_cs_control(dev, true);
-#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
-	if (SPI_OP_MODE_GET(config->operation) == SPI_OP_MODE_CONTROLLER) {
-		LL_SPI_StartMasterTransfer(spi);
-	}
-#endif /* st_stm32h7_spi */
 
 	do {
 		data->status_flags = 0;
@@ -2257,6 +2263,21 @@ static int transceive_dma(const struct device *dev,
 
 		if (ret != 0) {
 			break;
+		}
+
+		/*
+		 * Set SPE only once the DMA is armed: once SPE is set, the
+		 * controller drives MOSI whether or not a frame has arrived, which
+		 * stretches the first bit on the wire. Later chunks find the SPI
+		 * enabled.
+		 */
+		if (!LL_SPI_IsEnabled(spi)) {
+			LL_SPI_Enable(spi);
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+			if (SPI_OP_MODE_GET(config->operation) == SPI_OP_MODE_CONTROLLER) {
+				LL_SPI_StartMasterTransfer(spi);
+			}
+#endif /* st_stm32h7_spi */
 		}
 
 #ifdef CONFIG_SPI_ASYNC
